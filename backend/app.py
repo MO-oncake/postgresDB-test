@@ -1,8 +1,10 @@
 import os
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, redirect, url_for, session
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from dotenv import load_dotenv
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import timedelta
 
 # Load environment variables from .env file
 load_dotenv()
@@ -11,6 +13,8 @@ app = Flask(__name__)
 
 # Set up the secret key for sessions and security purposes
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'default_secret_key')
+app.config['SESSION_COOKIE_NAME'] = 'session'
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=5)
 
 # Set up the PostgreSQL database connection using SQLAlchemy
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
@@ -22,7 +26,7 @@ db = SQLAlchemy(app)
 # Enable Cross-Origin Resource Sharing (CORS)
 CORS(app)
 
-# Define your models here
+# Define models here
 class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
@@ -102,7 +106,84 @@ class Payment(db.Model):
     transaction_id = db.Column(db.String(255))
     status = db.Column(db.String(50))
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
+	
+# Define routes here
+# Register route
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    username = data.get('username')
+    email = data.get('email')
+    password = data.get('password')
+    role = data.get('role')  # (either user or organiser)
 
+    if not username:
+        return jsonify({"message": "Username is required"}), 400
+
+    # Hash password for storage
+    hashed_password = generate_password_hash(password, method='pbkdf2:sha256')
+
+    # Check if user already exists
+    existing_user = User.query.filter_by(email=email).first()
+    if existing_user:
+        return jsonify({"message": "User already exists"}), 409
+
+    # Create new user and add to database
+    new_user = User(
+        username=username,
+        email=email,
+        password=hashed_password,
+        role=role
+    )
+    db.session.add(new_user)
+    db.session.commit()
+
+    return jsonify({"message": "User registered successfully!"}), 201
+
+
+# Login route
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    email = data.get('email')
+    password = data.get('password')
+
+    # Find user by email
+    user = User.query.filter_by(email=email).first()
+    if not user or not check_password_hash(user.password, password):
+        return jsonify({"message": "Invalid credentials"}), 401
+    
+    # Store user information in session
+    session['user_id'] = user.id
+    session['username'] = user.username
+    session['role'] = user.role
+
+    return jsonify({"message": "Logged in successfully"}), 200
+
+# Logout route
+@app.route('/logout', methods=['GET'])
+def logout():
+    session.pop('user_id', None)
+    session.pop('username', None)
+    session.pop('role', None)
+    return redirect(url_for('home'))
+
+# Home route
+@app.route('/')
+def home():
+    if 'user_id' in session:
+        return jsonify({"message": f"Welcome {session['username']}"}), 200
+    else:
+        return jsonify({"message": "You are not logged in"}), 401
+
+# Route for checking if the user is logged in
+@app.route('/check_login', methods=['GET'])
+def check_login():
+    if 'user_id' in session:
+        return jsonify({"message": "User is logged in", "username": session['username']}), 200
+    else:
+        return jsonify({"message": "User is not logged in"}), 401
+		
 # Routes for Users
 @app.route('/users', methods=['GET'])
 def get_users():
@@ -121,28 +202,132 @@ def get_user(id):
 @app.route('/events', methods=['GET'])
 def get_events():
     events = Event.query.all()
-    events_data = [{"id": event.id, "name": event.name, "venue": event.venue, "time": event.time} for event in events]
+    events_data = []
+    for event in events:
+        # Fetch the event date from the EventDate table
+        event_date = EventDate.query.filter_by(event_id=event.id).first()
+        date = event_date.event_date.strftime('%Y-%m-%d') if event_date else None
+        
+        # Fetch the ticket counts from the EventTicketCount table
+        ticket_counts = EventTicketCount.query.filter_by(event_id=event.id).all()
+        ticket_data = []
+        for count in ticket_counts:
+            ticket_data.append({
+                "tier": count.tier,
+                "total_count": count.total_count,
+                "available_count": count.available_count,
+                "total_purchased": count.total_purchased
+            })
+
+        # Fetch the ticket types (tiers) and prices from the EventTicketType table
+        ticket_types = EventTicketType.query.filter_by(event_id=event.id).all()
+        ticket_types_data = []
+        for ticket in ticket_types:
+            ticket_types_data.append({
+                "tier_name": ticket.tier_name,
+                "price": ticket.price
+            })
+        
+        events_data.append({
+            "id": event.id,
+            "name": event.name,
+            "description": event.description,
+            "venue": event.venue,
+            "time": event.time.strftime('%H:%M') if event.time else None,
+            "image_url": event.image_url,
+            "date": date,
+            "ticket_counts": ticket_data,  # Added ticket counts for each tier
+            "ticket_types": ticket_types_data  # Added ticket types and prices
+        })
     return jsonify(events_data), 200
 
 @app.route('/events/<int:id>', methods=['GET'])
 def get_event(id):
     event = Event.query.get(id)
     if event:
-        return jsonify({"id": event.id, "name": event.name, "venue": event.venue, "time": event.time}), 200
+        # Fetch the event date from the EventDate table
+        event_date = EventDate.query.filter_by(event_id=event.id).first()
+        date = event_date.event_date.strftime('%Y-%m-%d') if event_date else None
+        
+        # Fetch the ticket counts from the EventTicketCount table
+        ticket_counts = EventTicketCount.query.filter_by(event_id=event.id).all()
+        ticket_data = []
+        for count in ticket_counts:
+            ticket_data.append({
+                "tier": count.tier,
+                "total_count": count.total_count,
+                "available_count": count.available_count,
+                "total_purchased": count.total_purchased
+            })
+
+        # Fetch the ticket types (tiers) and prices from the EventTicketType table
+        ticket_types = EventTicketType.query.filter_by(event_id=event.id).all()
+        ticket_types_data = []
+        for ticket in ticket_types:
+            ticket_types_data.append({
+                "tier_name": ticket.tier_name,
+                "price": ticket.price
+            })
+        
+        return jsonify({
+            "id": event.id,
+            "name": event.name,
+            "description": event.description,
+            "venue": event.venue,
+            "time": event.time.strftime('%H:%M') if event.time else None,
+            "image_url": event.image_url,
+            "date": date,
+            "ticket_counts": ticket_data,  # Added ticket counts for each tier
+            "ticket_types": ticket_types_data  # Added ticket types and prices
+        }), 200
     return jsonify({"message": "Event not found"}), 404
 
 @app.route('/events', methods=['POST'])
 def create_event():
     data = request.get_json()
+
+    # Create the event
     new_event = Event(
         name=data.get('name'),
         description=data.get('description'),
         venue=data.get('venue'),
         time=data.get('time'),
+        image_url=data.get('image_url'),
         organiser_id=data.get('organiser_id', 1)  # Default to organiser 1
     )
     db.session.add(new_event)
     db.session.commit()
+
+    # Create the event date in the EventDate table
+    event_date = data.get('event_date')
+    if event_date:
+        new_event_date = EventDate(event_id=new_event.id, event_date=event_date)
+        db.session.add(new_event_date)
+        db.session.commit()
+
+    # Create ticket counts and types for the event
+    ticket_counts_data = data.get('ticket_counts', [])
+    for ticket_count in ticket_counts_data:
+        ticket_count_entry = EventTicketCount(
+            event_id=new_event.id,
+            tier=ticket_count.get('tier'),
+            total_count=ticket_count.get('total_count'),
+            available_count=ticket_count.get('available_count'),
+            total_purchased=0  # Initially 0 tickets purchased
+        )
+        db.session.add(ticket_count_entry)
+
+    ticket_types_data = data.get('ticket_types', [])
+    for ticket_type in ticket_types_data:
+        ticket_type_entry = EventTicketType(
+            event_id=new_event.id,
+            tier_name=ticket_type.get('tier_name'),
+            price=ticket_type.get('price')
+        )
+        db.session.add(ticket_type_entry)
+
+    db.session.commit()
+
     return jsonify({"message": "Event created successfully!"}), 201
 
 @app.route('/events/<int:id>', methods=['PUT'])
@@ -150,11 +335,60 @@ def update_event(id):
     data = request.get_json()
     event = Event.query.get(id)
     if event:
+        # Update event details
         event.name = data.get('name', event.name)
         event.description = data.get('description', event.description)
         event.venue = data.get('venue', event.venue)
         event.time = data.get('time', event.time)
+        event.image_url = data.get('image_url', event.image_url)
         db.session.commit()
+
+        # Update the event date in the EventDate table
+        event_date = data.get('event_date')
+        if event_date:
+            existing_event_date = EventDate.query.filter_by(event_id=event.id).first()
+            if existing_event_date:
+                existing_event_date.event_date = event_date
+            else:
+                new_event_date = EventDate(event_id=event.id, event_date=event_date)
+                db.session.add(new_event_date)
+            db.session.commit()
+
+        # Update ticket counts and types for the event
+        ticket_counts_data = data.get('ticket_counts', [])
+        for ticket_count in ticket_counts_data:
+            existing_ticket_count = EventTicketCount.query.filter_by(
+                event_id=event.id, tier=ticket_count.get('tier')).first()
+            if existing_ticket_count:
+                existing_ticket_count.total_count = ticket_count.get('total_count', existing_ticket_count.total_count)
+                existing_ticket_count.available_count = ticket_count.get('available_count', existing_ticket_count.available_count)
+                existing_ticket_count.total_purchased = ticket_count.get('total_purchased', existing_ticket_count.total_purchased)
+            else:
+                new_ticket_count_entry = EventTicketCount(
+                    event_id=event.id,
+                    tier=ticket_count.get('tier'),
+                    total_count=ticket_count.get('total_count'),
+                    available_count=ticket_count.get('available_count'),
+                    total_purchased=0  # Initially 0 tickets purchased
+                )
+                db.session.add(new_ticket_count_entry)
+
+        ticket_types_data = data.get('ticket_types', [])
+        for ticket_type in ticket_types_data:
+            existing_ticket_type = EventTicketType.query.filter_by(
+                event_id=event.id, tier_name=ticket_type.get('tier_name')).first()
+            if existing_ticket_type:
+                existing_ticket_type.price = ticket_type.get('price', existing_ticket_type.price)
+            else:
+                new_ticket_type_entry = EventTicketType(
+                    event_id=event.id,
+                    tier_name=ticket_type.get('tier_name'),
+                    price=ticket_type.get('price')
+                )
+                db.session.add(new_ticket_type_entry)
+
+        db.session.commit()
+
         return jsonify({"message": "Event updated successfully!"}), 200
     return jsonify({"message": "Event not found"}), 404
 
@@ -164,6 +398,13 @@ def delete_event(id):
     if event:
         db.session.delete(event)
         db.session.commit()
+
+        # Also delete the associated event date
+        event_date = EventDate.query.filter_by(event_id=event.id).first()
+        if event_date:
+            db.session.delete(event_date)
+            db.session.commit()
+
         return jsonify({"message": "Event deleted successfully!"}), 200
     return jsonify({"message": "Event not found"}), 404
 
